@@ -39,6 +39,8 @@ def viser_wrapper(
     background_mode: bool = False,
     mask_sky: bool = False,
     image_folder: str = None,
+    mask_dir: str = None,
+    mask_suffix: str = "_mask",
 ):
     """
     Visualize predicted 3D points and camera poses with viser.
@@ -88,6 +90,10 @@ def viser_wrapper(
     # Apply sky segmentation if enabled
     if mask_sky and image_folder is not None:
         conf = apply_sky_segmentation(conf, image_folder)
+    
+    # Apply user-provided masks if mask_dir is specified
+    if mask_dir is not None and os.path.exists(mask_dir) and image_folder is not None:
+        conf = apply_user_masks(conf, image_folder, mask_dir, mask_suffix)
 
     # Convert images from (S, 3, H, W) to (S, H, W, 3)
     # Then flatten everything for the point cloud
@@ -255,6 +261,65 @@ def viser_wrapper(
 # Helper functions for sky segmentation
 
 
+def apply_user_masks(conf: np.ndarray, image_folder: str, mask_dir: str, mask_suffix: str = "_mask") -> np.ndarray:
+    """
+    Apply user-provided binary masks to confidence scores.
+    
+    Args:
+        conf (np.ndarray): Confidence scores with shape (S, H, W)
+        image_folder (str): Path to the folder containing input images
+        mask_dir (str): Path to the folder containing mask images
+        mask_suffix (str): Suffix for mask filenames (default: "_mask")
+    
+    Returns:
+        np.ndarray: Updated confidence scores with masked regions set to 0
+    """
+    S, H, W = conf.shape
+    image_files = sorted(glob.glob(os.path.join(image_folder, "*")))
+    mask_list = []
+    
+    print(f"Loading masks from {mask_dir}...")
+    for i, image_path in enumerate(tqdm(image_files[:S])):
+        image_name = os.path.basename(image_path)
+        image_stem = os.path.splitext(image_name)[0]
+        
+        # Try to find mask file with various extensions
+        mask_found = False
+        for ext in ['.png', '.jpg', '.jpeg', '.bmp']:
+            mask_filename = image_stem + mask_suffix + ext
+            mask_path = os.path.join(mask_dir, mask_filename)
+            if os.path.exists(mask_path):
+                mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+                if mask is not None:
+                    # Resize mask to match H×W if needed
+                    if mask.shape[0] != H or mask.shape[1] != W:
+                        mask = cv2.resize(mask, (W, H), interpolation=cv2.INTER_NEAREST)
+                    mask_list.append(mask)
+                    mask_found = True
+                    print(f"  Loaded mask for {image_name}")
+                    break
+        
+        if not mask_found:
+            print(f"  Warning: Mask not found for {image_name}, using full mask")
+            # Create a full mask (all pixels valid) if mask not found
+            mask_list.append(np.ones((H, W), dtype=np.uint8) * 255)
+    
+    if len(mask_list) > 0:
+        # Convert list to numpy array with shape S×H×W
+        mask_array = np.array(mask_list)
+        # Apply mask to confidence scores: 
+        # Black (0) = use for GS (keep points), White (255) = exclude (only for point cloud visualization)
+        # So we invert: white parts get 0 confidence, black parts keep original confidence
+        mask_binary = (mask_array <= 127).astype(np.float32)  # Black parts = 1.0, White parts = 0.0
+        conf = conf * mask_binary
+        print(f"User masks applied successfully to {len(mask_list)} images")
+        print(f"  Black regions (GS target): kept, White regions (point cloud only): excluded")
+    else:
+        print("Warning: No masks found, skipping mask application")
+    
+    return conf
+
+
 def apply_sky_segmentation(conf: np.ndarray, image_folder: str) -> np.ndarray:
     """
     Apply sky segmentation to confidence scores.
@@ -316,6 +381,8 @@ parser.add_argument(
     "--conf_threshold", type=float, default=25.0, help="Initial percentage of low-confidence points to filter out"
 )
 parser.add_argument("--mask_sky", action="store_true", help="Apply sky segmentation to filter out sky points")
+parser.add_argument("--mask_dir", type=str, default=None, help="Path to directory containing mask images (auto-detected if not specified)")
+parser.add_argument("--mask_suffix", type=str, default="_mask", help="Suffix for mask filenames (default: '_mask')")
 
 
 def main():
@@ -383,6 +450,16 @@ def main():
 
     if args.mask_sky:
         print("Sky segmentation enabled - will filter out sky points")
+    
+    # Auto-detect mask directory if not specified
+    mask_dir = args.mask_dir
+    if mask_dir is None:
+        mask_dir = os.path.join(os.path.dirname(args.image_folder), "masks")
+        if not os.path.exists(mask_dir):
+            mask_dir = None
+    
+    if mask_dir and os.path.exists(mask_dir):
+        print(f"User masks directory found: {mask_dir}")
 
     print("Starting viser visualization...")
 
@@ -394,6 +471,8 @@ def main():
         background_mode=args.background_mode,
         mask_sky=args.mask_sky,
         image_folder=args.image_folder,
+        mask_dir=mask_dir,
+        mask_suffix=args.mask_suffix,
     )
     print("Visualization complete")
 

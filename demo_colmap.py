@@ -9,6 +9,7 @@ import numpy as np
 import glob
 import os
 import copy
+import re
 import torch
 import torch.nn.functional as F
 
@@ -44,6 +45,8 @@ def parse_args():
     parser.add_argument("--scene_dir", type=str, required=True, help="Directory containing the scene images")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--use_ba", action="store_true", default=False, help="Use BA for reconstruction")
+    parser.add_argument("--mask_dir", type=str, default=None, help="Path to directory containing mask images (auto-detected if not specified)")
+    parser.add_argument("--mask_suffix", type=str, default="_mask", help="Suffix for mask filenames (default: '_mask')")
     ######### BA parameters #########
     parser.add_argument(
         "--max_reproj_error", type=float, default=8.0, help="Maximum reprojection error for reconstruction"
@@ -58,6 +61,10 @@ def parse_args():
     )
     parser.add_argument(
         "--conf_thres_value", type=float, default=5.0, help="Confidence threshold value for depth filtering (wo BA)"
+    )
+    parser.add_argument(
+        "--region", type=str, choices=["black", "white", "both"], default="both",
+        help="Which mask region to process: 'black' (GS target), 'white' (point cloud only), or 'both' (default)"
     )
     return parser.parse_args()
 
@@ -90,7 +97,21 @@ def run_VGGT(model, images, dtype, resolution=518):
     return extrinsic, intrinsic, depth_map, depth_conf
 
 
-def demo_fn(args):
+def load_vggt_model(device=None, dtype=None):
+    """VGGTモデルをロード（再利用可能）"""
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    if dtype is None:
+        dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+    
+    model = VGGT()
+    _URL = "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
+    model.load_state_dict(torch.hub.load_state_dict_from_url(_URL))
+    model.eval()
+    model = model.to(device)
+    return model, device, dtype
+
+def demo_fn(args, model=None):
     # Print configuration
     print("Arguments:", vars(args))
 
@@ -110,12 +131,11 @@ def demo_fn(args):
     print(f"Using dtype: {dtype}")
 
     # Run VGGT for camera and depth estimation
-    model = VGGT()
-    _URL = "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
-    model.load_state_dict(torch.hub.load_state_dict_from_url(_URL))
-    model.eval()
-    model = model.to(device)
-    print(f"Model loaded")
+    if model is None:
+        model, device, dtype = load_vggt_model(device, dtype)
+        print(f"Model loaded")
+    else:
+        print(f"Using provided model")
 
     # Get image paths and preprocess them
     image_dir = os.path.join(args.scene_dir, "images")
@@ -123,6 +143,18 @@ def demo_fn(args):
     if len(image_path_list) == 0:
         raise ValueError(f"No images found in {image_dir}")
     base_image_path_list = [os.path.basename(path) for path in image_path_list]
+    
+    # Auto-detect mask directory if not specified
+    mask_dir = args.mask_dir
+    if mask_dir is None:
+        mask_dir = os.path.join(args.scene_dir, "masks")
+        if not os.path.exists(mask_dir):
+            mask_dir = None
+    
+    if mask_dir and os.path.exists(mask_dir):
+        print(f"Mask directory found: {mask_dir}")
+    else:
+        print("No mask directory found, proceeding without masks")
 
     # Load images and original coordinates
     # Load Image in 1024, while running VGGT with 518
@@ -199,6 +231,7 @@ def demo_fn(args):
 
         image_size = np.array([vggt_fixed_resolution, vggt_fixed_resolution])
         num_frames, height, width, _ = points_3d.shape
+        reconstruction_resolution = vggt_fixed_resolution
 
         points_rgb = F.interpolate(
             images, size=(vggt_fixed_resolution, vggt_fixed_resolution), mode="bilinear", align_corners=False
@@ -209,44 +242,223 @@ def demo_fn(args):
         # (S, H, W, 3), with x, y coordinates and frame indices
         points_xyf = create_pixel_coordinate_grid(num_frames, height, width)
 
-        conf_mask = depth_conf >= conf_thres_value
+        # Apply user-provided masks if available
+        # Black regions (GS target) = keep, White regions (point cloud only) = exclude
+        user_masks = None
+        if mask_dir is not None and os.path.exists(mask_dir):
+            from apply_mask_to_colmap import load_masks
+            # 四桁の数字でマスクと画像を対応付ける
+            # 画像ファイル名に4桁の数字が含まれているかチェック
+            # 例: frame_000030.jpg -> 4桁あり、00.jpg -> 4桁なし
+            sample_images = glob.glob(os.path.join(image_dir, "*"))
+            sample_image = sample_images[0] if sample_images else ""
+            has_four_digit = bool(re.search(r'\d{4}', os.path.basename(sample_image)))
+            
+            # 4桁の数字がある場合のみuse_four_digit_matchingを使用
+            user_masks = load_masks(image_dir, mask_dir, args.mask_suffix, target_shape=(height, width), use_four_digit_matching=has_four_digit)
+            if user_masks is not None:
+                print(f"User masks loaded: {user_masks.shape}")
+        
+        # conf_maskを生成（マスクがある場合は、マスク領域内でのみ生成）
+        if user_masks is not None:
+            # マスク領域内でのみconf_maskを生成
+            # 黒領域（GS対象）のマスク: mask == 1.0 (black regions)
+            black_mask_bool = user_masks > 0.5
+            # マスク領域内では、まず通常の閾値で試し、点が少ない場合は閾値を下げる
+            # マスク領域内の深度信頼度の分布を考慮
+            mask_conf_thres = conf_thres_value
+            conf_mask_masked = (depth_conf >= mask_conf_thres) & black_mask_bool
+            mask_point_count = conf_mask_masked.sum().item()
+            
+            # マスク領域内の点が少ない場合（1000点未満）、閾値を段階的に下げる
+            if mask_point_count < 1000:
+                for thres in [3.0, 2.0, 1.0, 0.5, 0.0]:
+                    conf_mask_masked = (depth_conf >= thres) & black_mask_bool
+                    mask_point_count = conf_mask_masked.sum().item()
+                    if mask_point_count >= 1000:
+                        mask_conf_thres = thres
+                        print(f"Debug: Lowered mask-specific conf_thres to {thres} to get {mask_point_count} points")
+                        break
+                else:
+                    # それでも点が少ない場合は、マスク領域内の全ての点を使用
+                    conf_mask_masked = black_mask_bool
+                    mask_conf_thres = 0.0
+                    print(f"Debug: Using all points in mask region (no conf threshold)")
+            
+            conf_mask = conf_mask_masked
+            print(f"Debug: Final mask-specific conf_thres: {mask_conf_thres}, points: {conf_mask.sum().item()}")
+        else:
+            conf_mask = depth_conf >= conf_thres_value
+        
         # at most writing 100000 3d points to colmap reconstruction object
         conf_mask = randomly_limit_trues(conf_mask, max_points_for_colmap)
+        
+        # 白領域（点群のみ）と黒領域（GS対象）で別々の点群を生成
+        if user_masks is not None:
+            # 形状の確認とデバッグ
+            print(f"Debug: conf_mask shape: {conf_mask.shape}, user_masks shape: {user_masks.shape}")
+            print(f"Debug: conf_mask dtype: {conf_mask.dtype}, user_masks dtype: {user_masks.dtype}")
+            print(f"Debug: conf_mask True count: {conf_mask.sum().item()}")
+            print(f"Debug: user_masks > 0.5 count: {(user_masks > 0.5).sum().item()}")
+            
+            # 形状が一致していることを確認
+            if conf_mask.shape != user_masks.shape:
+                print(f"Warning: Shape mismatch! conf_mask: {conf_mask.shape}, user_masks: {user_masks.shape}")
+                # リサイズして形状を合わせる
+                user_masks_tensor = torch.from_numpy(user_masks).float()
+                if len(user_masks_tensor.shape) == 3:
+                    user_masks_tensor = user_masks_tensor.unsqueeze(0)  # (1, S, H, W)
+                user_masks_resized = F.interpolate(
+                    user_masks_tensor, 
+                    size=(conf_mask.shape[1], conf_mask.shape[2]), 
+                    mode='nearest'
+                )
+                user_masks = user_masks_resized.squeeze(0).numpy()
+                print(f"Debug: Resized user_masks to: {user_masks.shape}")
+            
+            # Flatten both conf_mask and masks to match
+            conf_mask_flat = conf_mask.reshape(-1)
+            mask_flat = user_masks.reshape(-1)
+            
+            # 黒領域（GS対象）のマスク: mask == 1.0 (black regions)
+            black_mask_flat = conf_mask_flat & (mask_flat > 0.5)
+            # 白領域（点群のみ）のマスク: mask == 0.0 (white regions)
+            white_mask_flat = conf_mask_flat & (mask_flat <= 0.5)
+            
+            print(f"Mask statistics:")
+            print(f"  Black regions (GS target): {black_mask_flat.sum().item()} points")
+            print(f"  White regions (point cloud only): {white_mask_flat.sum().item()} points")
+            
+            # 処理対象の領域を決定
+            process_black = args.region in ["black", "both"]
+            process_white = args.region in ["white", "both"]
+            
+            reconstruction_black = None
+            reconstruction_white = None
+            
+            # 黒領域（GS対象）の処理
+            if process_black:
+                # 黒領域（GS対象）の点群を生成
+                black_mask = black_mask_flat.reshape(conf_mask.shape)
+                points_3d_black = points_3d[black_mask]
+                points_xyf_black = points_xyf[black_mask]
+                points_rgb_black = points_rgb[black_mask]
+                
+                # 黒領域（GS対象）のCOLMAPを生成
+                print("Converting black regions (GS target) to COLMAP format")
+                reconstruction_black = batch_np_matrix_to_pycolmap_wo_track(
+                    points_3d_black,
+                    points_xyf_black,
+                    points_rgb_black,
+                    extrinsic,
+                    intrinsic,
+                    image_size,
+                    shared_camera=shared_camera,
+                    camera_type=camera_type,
+                )
+                
+                # 黒領域（GS対象）のCOLMAPを保存
+                reconstruction_black = rename_colmap_recons_and_rescale_camera(
+                    reconstruction_black,
+                    base_image_path_list,
+                    original_coords.cpu().numpy(),
+                    img_size=reconstruction_resolution,
+                    shift_point2d_to_original_res=True,
+                    shared_camera=shared_camera,
+                )
+                
+                sparse_reconstruction_dir_black = os.path.join(args.scene_dir, "sparse")
+                os.makedirs(sparse_reconstruction_dir_black, exist_ok=True)
+                reconstruction_black.write(sparse_reconstruction_dir_black)
+                print(f"Saved black regions (GS target) reconstruction to {sparse_reconstruction_dir_black}")
+                
+                # 黒領域（GS対象）の点群を保存
+                trimesh.PointCloud(points_3d_black, colors=points_rgb_black).export(
+                    os.path.join(args.scene_dir, "sparse/points_black.ply")
+                )
+            
+            # 白領域（点群のみ）の処理
+            if process_white:
+                # 白領域（点群のみ）の点群を生成
+                white_mask = white_mask_flat.reshape(conf_mask.shape)
+                points_3d_white = points_3d[white_mask]
+                points_xyf_white = points_xyf[white_mask]
+                points_rgb_white = points_rgb[white_mask]
+                
+                # 白領域（点群のみ）のCOLMAPを生成
+                print("Converting white regions (point cloud only) to COLMAP format")
+                reconstruction_white = batch_np_matrix_to_pycolmap_wo_track(
+                    points_3d_white,
+                    points_xyf_white,
+                    points_rgb_white,
+                    extrinsic,
+                    intrinsic,
+                    image_size,
+                    shared_camera=shared_camera,
+                    camera_type=camera_type,
+                )
+                
+                # 白領域（点群のみ）のCOLMAPを保存
+                reconstruction_white = rename_colmap_recons_and_rescale_camera(
+                    reconstruction_white,
+                    base_image_path_list,
+                    original_coords.cpu().numpy(),
+                    img_size=reconstruction_resolution,
+                    shift_point2d_to_original_res=True,
+                    shared_camera=shared_camera,
+                )
+                
+                sparse_reconstruction_dir_white = os.path.join(args.scene_dir, "sparse_white")
+                os.makedirs(sparse_reconstruction_dir_white, exist_ok=True)
+                reconstruction_white.write(sparse_reconstruction_dir_white)
+                print(f"Saved white regions (point cloud only) reconstruction to {sparse_reconstruction_dir_white}")
+                
+                # 白領域（点群のみ）の点群を保存
+                trimesh.PointCloud(points_3d_white, colors=points_rgb_white).export(
+                    os.path.join(args.scene_dir, "sparse_white/points_white.ply")
+                )
+            
+            # メインのreconstructionは黒領域（GS対象）を使用（存在する場合）
+            if reconstruction_black is not None:
+                reconstruction = reconstruction_black
+            elif reconstruction_white is not None:
+                reconstruction = reconstruction_white
+            else:
+                raise ValueError("No reconstruction generated. Check --region argument.")
+        else:
+            # マスクがない場合は従来通り
+            points_3d = points_3d[conf_mask]
+            points_xyf = points_xyf[conf_mask]
+            points_rgb = points_rgb[conf_mask]
 
-        points_3d = points_3d[conf_mask]
-        points_xyf = points_xyf[conf_mask]
-        points_rgb = points_rgb[conf_mask]
+            print("Converting to COLMAP format")
+            reconstruction = batch_np_matrix_to_pycolmap_wo_track(
+                points_3d,
+                points_xyf,
+                points_rgb,
+                extrinsic,
+                intrinsic,
+                image_size,
+                shared_camera=shared_camera,
+                camera_type=camera_type,
+            )
+            
+            reconstruction = rename_colmap_recons_and_rescale_camera(
+                reconstruction,
+                base_image_path_list,
+                original_coords.cpu().numpy(),
+                img_size=reconstruction_resolution,
+                shift_point2d_to_original_res=True,
+                shared_camera=shared_camera,
+            )
 
-        print("Converting to COLMAP format")
-        reconstruction = batch_np_matrix_to_pycolmap_wo_track(
-            points_3d,
-            points_xyf,
-            points_rgb,
-            extrinsic,
-            intrinsic,
-            image_size,
-            shared_camera=shared_camera,
-            camera_type=camera_type,
-        )
+            print(f"Saving reconstruction to {args.scene_dir}/sparse")
+            sparse_reconstruction_dir = os.path.join(args.scene_dir, "sparse")
+            os.makedirs(sparse_reconstruction_dir, exist_ok=True)
+            reconstruction.write(sparse_reconstruction_dir)
 
-        reconstruction_resolution = vggt_fixed_resolution
-
-    reconstruction = rename_colmap_recons_and_rescale_camera(
-        reconstruction,
-        base_image_path_list,
-        original_coords.cpu().numpy(),
-        img_size=reconstruction_resolution,
-        shift_point2d_to_original_res=True,
-        shared_camera=shared_camera,
-    )
-
-    print(f"Saving reconstruction to {args.scene_dir}/sparse")
-    sparse_reconstruction_dir = os.path.join(args.scene_dir, "sparse")
-    os.makedirs(sparse_reconstruction_dir, exist_ok=True)
-    reconstruction.write(sparse_reconstruction_dir)
-
-    # Save point cloud for fast visualization
-    trimesh.PointCloud(points_3d, colors=points_rgb).export(os.path.join(args.scene_dir, "sparse/points.ply"))
+            # Save point cloud for fast visualization
+            trimesh.PointCloud(points_3d, colors=points_rgb).export(os.path.join(args.scene_dir, "sparse/points.ply"))
 
     return True
 

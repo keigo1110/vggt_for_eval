@@ -147,3 +147,59 @@ skyseg.onnx
 # pixi environments
 .pixi
 *.egg-info
+
+examples/
+
+# Evaluation results and reports
+*_results*.csv
+*_results*.json
+*_evaluation*.md
+*_evaluation*.json
+*_report*.md
+*_REPORT*.md
+*_EVALUATION*.md
+*_ANALYSIS*.md
+*_SUMMARY*.md
+*_INDEX*.md
+*_comparison*.json
+*_quality*.json
+*_quality*.csv
+evaluation_results*/
+evaluation_results_*/
+
+# Dataset files
+*.zip
+bike/
+cooking/
+health/
+test_*/
+
+# Temporary files
+*.tmp
+*.json.tmp
+
+# Retraining and checkpoint related
+retraining_progress*.json
+retraining_results.json
+selected_*.json
+
+# Comparison and analysis scripts (generated)
+*_comparison*.py
+analyze_*.py
+check_*.py
+generate_*.py
+create_*.py
+evaluate_*.py
+monitor_*.py
+process_*.py
+prepare_*.py
+retrain_*.py
+regenerate_*.py
+render_*.py
+visualize_*.py
+export_*.py
+apply_*.py
+detect_*.py
+reevaluate_*.py
+consolidate_*.py
+find_*.py
