@@ -1,3 +1,5 @@
+> **Note:** This repository is a working copy based on [VGGT (facebookresearch/vggt)](https://github.com/facebookresearch/vggt) (CVPR 2025). Original work by Wang et al. See citation and license below.
+
 <div align="center">
 <h1>VGGT: Visual Geometry Grounded Transformer</h1>
 
